@@ -100,7 +100,9 @@ static char kApolloLinkPreviewNodesKey;
 static char kApolloLinkPreviewFetchInFlightKey;
 static char kApolloLinkPreviewOriginalHostShellKey;
 
+static NSMutableSet<NSString *> *ApolloLPLoggedHosts(void);
 static void ApolloLPLogOncePerHost(NSString *host, NSString *event);
+static NSString * const ApolloLinkPreviewDidActivateNotification = @"ApolloLinkPreviewDidActivateNotification";
 
 static Class ApolloLPClass(NSString *name) {
     return NSClassFromString(name);
@@ -191,6 +193,13 @@ static UIColor *ApolloLPTintCandidate(UIColor *color, UITraitCollection *traitCo
     return color;
 }
 
+static BOOL ApolloLPColorIsVisibleSurface(UIColor *color, UITraitCollection *traitCollection) {
+    UIColor *resolvedColor = ApolloLPResolvedColor(color, traitCollection);
+    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 1.0;
+    if (![resolvedColor getRed:&red green:&green blue:&blue alpha:&alpha]) return NO;
+    return alpha >= 0.08;
+}
+
 static UIView *ApolloLPViewForNode(ASDisplayNode *node) {
     if (!node || ![node respondsToSelector:@selector(view)]) return nil;
     @try {
@@ -199,6 +208,45 @@ static UIView *ApolloLPViewForNode(ASDisplayNode *node) {
     } @catch (__unused NSException *exception) {
         return nil;
     }
+}
+
+static UIColor *ApolloLPBackgroundColorForView(UIView *view, UITraitCollection *traitCollection) {
+    if (!view) return nil;
+
+    if ([view isKindOfClass:[UITableViewCell class]]) {
+        UITableViewCell *cell = (UITableViewCell *)view;
+        UIColor *contentColor = cell.contentView.backgroundColor;
+        if (ApolloLPColorIsVisibleSurface(contentColor, traitCollection)) return contentColor;
+    }
+
+    UIColor *backgroundColor = view.backgroundColor;
+    return ApolloLPColorIsVisibleSurface(backgroundColor, traitCollection) ? backgroundColor : nil;
+}
+
+static UIColor *ApolloLPThemedSurfaceColorForNode(ASDisplayNode *hostNode) {
+    UITraitCollection *traitCollection = nil;
+    for (ASDisplayNode *node = hostNode; node; node = node.supernode) {
+        UIView *view = ApolloLPViewForNode(node);
+        for (UIView *current = view; current; current = current.superview) {
+            UITraitCollection *traits = current.traitCollection ?: traitCollection ?: UIScreen.mainScreen.traitCollection;
+            UIColor *candidate = ApolloLPBackgroundColorForView(current, traits);
+            if (candidate) return candidate;
+            traitCollection = traits;
+        }
+    }
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (!window.isKeyWindow) continue;
+            UIColor *candidate = ApolloLPBackgroundColorForView(window.rootViewController.view, window.traitCollection);
+            if (candidate) return candidate;
+            candidate = ApolloLPBackgroundColorForView(window, window.traitCollection);
+            if (candidate) return candidate;
+        }
+    }
+
+    return [UIColor secondarySystemBackgroundColor];
 }
 
 static UIColor *ApolloLPThemeTintColorForView(UIView *view, UITraitCollection *traitCollection, NSInteger depth) {
@@ -238,6 +286,40 @@ static UIColor *ApolloLPThemeTintColorForNode(ASDisplayNode *hostNode) {
     return [UIColor systemBlueColor];
 }
 
+static UIColor *ApolloLPAdjustColorBrightness(UIColor *color, CGFloat amount, UITraitCollection *traitCollection) {
+    UIColor *resolvedColor = ApolloLPResolvedColor(color, traitCollection);
+    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 1.0;
+    if (![resolvedColor getRed:&red green:&green blue:&blue alpha:&alpha]) return color;
+
+    red = MIN(MAX(red + amount, 0.0), 1.0);
+    green = MIN(MAX(green + amount, 0.0), 1.0);
+    blue = MIN(MAX(blue + amount, 0.0), 1.0);
+    return [UIColor colorWithRed:red green:green blue:blue alpha:MAX(alpha, 1.0)];
+}
+
+static NSString *ApolloLPColorDebugString(UIColor *color, UITraitCollection *traitCollection) {
+    UIColor *resolvedColor = ApolloLPResolvedColor(color, traitCollection);
+    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 1.0;
+    if (![resolvedColor getRed:&red green:&green blue:&blue alpha:&alpha]) return @"unknown";
+    return [NSString stringWithFormat:@"%.2f,%.2f,%.2f,%.2f", red, green, blue, alpha];
+}
+
+static void ApolloLPLogThemeCardOnce(NSString *host, UIColor *surfaceColor, UIColor *tintColor, UIColor *cardColor) {
+    if (host.length == 0) host = @"(nohost)";
+    NSString *key = [NSString stringWithFormat:@"%@|V13-theme-card", host];
+    @synchronized (ApolloLPLoggedHosts()) {
+        if ([ApolloLPLoggedHosts() containsObject:key]) return;
+        [ApolloLPLoggedHosts() addObject:key];
+    }
+
+    UITraitCollection *traits = UIScreen.mainScreen.traitCollection;
+    ApolloLog(@"[LinkPreviews] V13-theme-card host=%@ surface=%@ tint=%@ card=%@",
+              host,
+              ApolloLPColorDebugString(surfaceColor, traits),
+              ApolloLPColorDebugString(tintColor, traits),
+              ApolloLPColorDebugString(cardColor, traits));
+}
+
 static UIColor *ApolloLPBlendColor(UIColor *foreground, UIColor *background, CGFloat foregroundAlpha, UITraitCollection *traitCollection) {
     UIColor *resolvedForeground = ApolloLPResolvedColor(foreground, traitCollection);
     UIColor *resolvedBackground = ApolloLPResolvedColor(background, traitCollection);
@@ -256,17 +338,29 @@ static UIColor *ApolloLPBlendColor(UIColor *foreground, UIColor *background, CGF
 
 static UIColor *ApolloLPCardBackgroundColorForNode(ASDisplayNode *hostNode, NSURL *url) {
     UIColor *tintColor = ApolloLPThemeTintColorForNode(hostNode);
-    ApolloLPLogOncePerHost(ApolloLPHost(url), @"V12-theme-tint-resolved");
+    UIColor *surfaceColor = ApolloLPThemedSurfaceColorForNode(hostNode);
 
     if (@available(iOS 13.0, *)) {
         return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traitCollection) {
             BOOL dark = traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-            UIColor *base = dark ? [UIColor secondarySystemBackgroundColor] : [UIColor systemBackgroundColor];
-            return ApolloLPBlendColor(tintColor, base, dark ? 0.14 : 0.08, traitCollection);
+            UIColor *liftedSurface = ApolloLPAdjustColorBrightness(surfaceColor, dark ? 0.055 : -0.045, traitCollection);
+            UIColor *cardColor = ApolloLPBlendColor(tintColor, liftedSurface, dark ? 0.20 : 0.13, traitCollection);
+            ApolloLPLogThemeCardOnce(ApolloLPHost(url), surfaceColor, tintColor, cardColor);
+            return cardColor;
         }];
     }
 
-    return ApolloLPBlendColor(tintColor, [UIColor secondarySystemBackgroundColor], 0.12, UIScreen.mainScreen.traitCollection);
+    UIColor *liftedSurface = ApolloLPAdjustColorBrightness(surfaceColor, 0.04, UIScreen.mainScreen.traitCollection);
+    UIColor *cardColor = ApolloLPBlendColor(tintColor, liftedSurface, 0.16, UIScreen.mainScreen.traitCollection);
+    ApolloLPLogThemeCardOnce(ApolloLPHost(url), surfaceColor, tintColor, cardColor);
+    return cardColor;
+}
+
+static void ApolloLPNotifyPreviewActive(NSURL *url) {
+    if (!url.absoluteString.length) return;
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewDidActivateNotification
+                                                        object:nil
+                                                      userInfo:@{@"url": url}];
 }
 
 static NSString *ApolloLPBundleKey(NSURL *url, NSString *variant) {
@@ -969,6 +1063,7 @@ static NSString *ApolloLPVariant(ApolloLPArea area, NSInteger mode, ApolloLPCont
         }
         id placeholder = ApolloLPBuildPlaceholderSpec((ASDisplayNode *)self, url, placeholderContext, ApolloLPVariant(area, selectedMode, placeholderContext, YES));
         if (placeholder) {
+            ApolloLPNotifyPreviewActive(url);
             ApolloLPClearHostShell((ASDisplayNode *)self);
             ApolloLPLogOncePerHost(host, area == ApolloLPAreaComments ? @"area-comments-placeholder" : @"area-body-placeholder");
             ApolloLPLogOncePerHost(host, placeholderContext == ApolloLPContextSelfText ? @"mode-full-placeholder" : @"mode-compact-placeholder");
@@ -996,6 +1091,7 @@ static NSString *ApolloLPVariant(ApolloLPArea area, NSInteger mode, ApolloLPCont
         ? ApolloLPBuildHeroCardSpec((ASDisplayNode *)self, url, cached, ApolloLPVariant(area, selectedMode, context, NO))
         : ApolloLPBuildCompactCardSpec((ASDisplayNode *)self, url, cached, ApolloLPVariant(area, selectedMode, context, NO));
     if (richSpec) {
+        ApolloLPNotifyPreviewActive(url);
         ApolloLPClearHostShell((ASDisplayNode *)self);
         ApolloLPLogOncePerHost(host, area == ApolloLPAreaComments ? @"area-comments" : @"area-body");
         ApolloLPLogOncePerHost(host, context == ApolloLPContextSelfText ? @"mode-full" : @"mode-compact");
@@ -1019,4 +1115,5 @@ static NSString *ApolloLPVariant(ApolloLPArea area, NSInteger mode, ApolloLPCont
     ApolloLog(@"[LinkPreviews] V10 preview text restore active");
     ApolloLog(@"[LinkPreviews] V11 hero-card stability and naked-URL hiding active");
     ApolloLog(@"[LinkPreviews] V12 adaptive heights, theme tint, and URL hiding fix active");
+    ApolloLog(@"[LinkPreviews] V13 theme surfaces, academic metadata, and early URL hiding active");
 }

@@ -210,6 +210,120 @@ static NSURL *ApolloLinkPreviewURLFromString(NSString *string, NSURL *baseURL) {
     return ApolloLinkPreviewURLIsHTTP(url) ? url : nil;
 }
 
+static NSString *ApolloLinkPreviewStringByStrippingHTMLTags(NSString *string) {
+    NSString *clean = ApolloLinkPreviewCleanString(string);
+    if (clean.length == 0) return nil;
+
+    NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
+    return ApolloLinkPreviewCleanString(clean);
+}
+
+static NSString *ApolloLinkPreviewDOIFromURL(NSURL *url) {
+    if (!ApolloLinkPreviewURLIsHTTP(url)) return nil;
+
+    NSString *host = ApolloLinkPreviewHost(url);
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *part in [url.path componentsSeparatedByString:@"/"]) {
+        NSString *decoded = part.stringByRemovingPercentEncoding ?: part;
+        if (decoded.length > 0) [parts addObject:decoded];
+    }
+
+    NSString *doi = nil;
+    if ([host isEqualToString:@"doi.org"] && parts.count > 0) {
+        doi = [parts componentsJoinedByString:@"/"];
+    } else {
+        NSUInteger doiIndex = NSNotFound;
+        for (NSUInteger index = 0; index < parts.count; index++) {
+            if ([parts[index].lowercaseString isEqualToString:@"doi"]) {
+                doiIndex = index;
+                break;
+            }
+        }
+        if (doiIndex != NSNotFound && doiIndex + 1 < parts.count) {
+            doi = [[parts subarrayWithRange:NSMakeRange(doiIndex + 1, parts.count - doiIndex - 1)] componentsJoinedByString:@"/"];
+        }
+    }
+
+    if (doi.length == 0) {
+        NSString *absolute = url.absoluteString.stringByRemovingPercentEncoding ?: url.absoluteString;
+        NSRegularExpression *doiRegex = [NSRegularExpression regularExpressionWithPattern:@"10\\.\\d{4,9}/[^\\s?#\"'<>]+"
+                                                                                  options:NSRegularExpressionCaseInsensitive
+                                                                                    error:nil];
+        NSTextCheckingResult *match = [doiRegex firstMatchInString:absolute options:0 range:NSMakeRange(0, absolute.length)];
+        if (match) doi = [absolute substringWithRange:match.range];
+    }
+
+    doi = ApolloLinkPreviewCleanString(doi);
+    NSCharacterSet *trimSet = [NSCharacterSet characterSetWithCharactersInString:@".,);]}>"];
+    doi = [doi stringByTrimmingCharactersInSet:trimSet];
+    return [doi hasPrefix:@"10."] ? doi : nil;
+}
+
+static NSString *ApolloLinkPreviewFirstString(id value) {
+    if ([value isKindOfClass:[NSString class]]) return ApolloLinkPreviewCleanString(value);
+    if ([value isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)value) {
+            NSString *string = ApolloLinkPreviewFirstString(item);
+            if (string.length > 0) return string;
+        }
+    }
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)value;
+        return ApolloLinkPreviewFirstString(dict[@"url"] ?: dict[@"contentUrl"] ?: dict[@"name"] ?: dict[@"headline"]);
+    }
+    return nil;
+}
+
+static NSString *ApolloLinkPreviewJSONLDValueForKeys(id object, NSArray<NSString *> *keys) {
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)object;
+        for (NSString *key in keys) {
+            NSString *value = ApolloLinkPreviewFirstString(dict[key]);
+            if (value.length > 0) return value;
+        }
+        for (id child in dict.allValues) {
+            NSString *value = ApolloLinkPreviewJSONLDValueForKeys(child, keys);
+            if (value.length > 0) return value;
+        }
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id child in (NSArray *)object) {
+            NSString *value = ApolloLinkPreviewJSONLDValueForKeys(child, keys);
+            if (value.length > 0) return value;
+        }
+    }
+    return nil;
+}
+
+static NSDictionary<NSString *, NSString *> *ApolloLinkPreviewJSONLDValuesFromHTML(NSString *html) {
+    if (html.length == 0) return @{};
+
+    NSRegularExpression *scriptRegex = [NSRegularExpression regularExpressionWithPattern:@"<script\\s+[^>]*type\\s*=\\s*(['\"])[^'\"]*ld\\+json[^'\"]*\\1[^>]*>(.*?)</script>"
+                                                                                options:NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators
+                                                                                  error:nil];
+    NSArray<NSTextCheckingResult *> *matches = [scriptRegex matchesInString:html options:0 range:NSMakeRange(0, html.length)];
+    NSMutableDictionary<NSString *, NSString *> *values = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *match in matches) {
+        if (match.numberOfRanges < 3) continue;
+        NSString *jsonString = [html substringWithRange:[match rangeAtIndex:2]];
+        jsonString = [jsonString stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
+        NSData *jsonData = [jsonString dataUsingEncoding:NSUTF8StringEncoding];
+        if (!jsonData) continue;
+
+        id object = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+        NSString *siteName = ApolloLinkPreviewJSONLDValueForKeys(object, @[@"publisher", @"sourceOrganization"]);
+        NSString *title = ApolloLinkPreviewJSONLDValueForKeys(object, @[@"headline", @"name"]);
+        NSString *desc = ApolloLinkPreviewJSONLDValueForKeys(object, @[@"description", @"abstract"]);
+        NSString *image = ApolloLinkPreviewJSONLDValueForKeys(object, @[@"image", @"thumbnailUrl", @"contentUrl"]);
+        if (siteName.length > 0 && !values[@"jsonld:site_name"]) values[@"jsonld:site_name"] = siteName;
+        if (title.length > 0 && !values[@"jsonld:title"]) values[@"jsonld:title"] = title;
+        if (desc.length > 0 && !values[@"jsonld:description"]) values[@"jsonld:description"] = desc;
+        if (image.length > 0 && !values[@"jsonld:image"]) values[@"jsonld:image"] = image;
+        if (values.count >= 4) break;
+    }
+    return values;
+}
+
 static NSString *ApolloLinkPreviewTitleFromURL(NSURL *url) {
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     for (NSString *part in [url.path componentsSeparatedByString:@"/"]) {
@@ -253,7 +367,10 @@ static ApolloLinkPreview *ApolloLinkPreviewFallbackPreviewForURL(NSURL *url, NSS
     ApolloLinkPreview *preview = [ApolloLinkPreview new];
     preview.siteName = ApolloLinkPreviewHost(url);
     preview.title = title;
-    preview.desc = ApolloLinkPreviewCleanString(reason.length > 0 ? reason : url.absoluteString);
+    NSString *cleanReason = ApolloLinkPreviewCleanString(reason);
+    NSString *lowerReason = cleanReason.lowercaseString ?: @"";
+    if ([lowerReason containsString:@"text/html"] || [lowerReason containsString:@"charset="]) cleanReason = nil;
+    preview.desc = cleanReason;
     ApolloLinkPreviewApplyFallbackIcon(preview, url);
     preview.fetchedAt = [NSDate date];
     return preview;
@@ -347,6 +464,7 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
 + (void)fetchWikipediaPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion;
 + (void)fetchRedditPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion;
 + (void)fetchGitHubPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion;
++ (void)fetchCrossrefPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion;
 + (void)fetchHTMLPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion;
 @end
 
@@ -403,6 +521,11 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
         [self fetchRedditPreviewForURL:url completion:completion];
     } else if (ApolloLinkPreviewHostIs(url, @"github.com")) {
         [self fetchGitHubPreviewForURL:url completion:completion];
+    } else if (ApolloLinkPreviewHostIs(url, @"doi.org")) {
+        [self fetchCrossrefPreviewForURL:url completion:^(ApolloLinkPreview *preview) {
+            if (preview) completion(preview);
+            else [self fetchHTMLPreviewForURL:url completion:completion];
+        }];
     } else {
         [self fetchHTMLPreviewForURL:url completion:completion];
     }
@@ -649,6 +772,79 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
     }] resume];
 }
 
++ (NSString *)crossrefSummaryFromMessage:(NSDictionary *)message {
+    NSString *publisher = ApolloLinkPreviewFirstString(message[@"publisher"]);
+    NSString *container = ApolloLinkPreviewFirstString(message[@"container-title"]);
+    NSString *dateString = nil;
+    NSArray *dateParts = message[@"published-print"][@"date-parts"] ?: message[@"published-online"][@"date-parts"] ?: message[@"issued"][@"date-parts"];
+    NSArray *firstDate = [dateParts isKindOfClass:[NSArray class]] ? dateParts.firstObject : nil;
+    if ([firstDate isKindOfClass:[NSArray class]] && firstDate.count > 0) {
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (id part in firstDate) {
+            if ([part respondsToSelector:@selector(integerValue)]) [parts addObject:[NSString stringWithFormat:@"%ld", (long)[part integerValue]]];
+        }
+        dateString = [parts componentsJoinedByString:@"-"];
+    }
+
+    NSMutableArray<NSString *> *summaryParts = [NSMutableArray array];
+    if (container.length > 0) [summaryParts addObject:container];
+    if (publisher.length > 0 && ![publisher isEqualToString:container]) [summaryParts addObject:publisher];
+    if (dateString.length > 0) [summaryParts addObject:dateString];
+    return summaryParts.count > 0 ? [summaryParts componentsJoinedByString:@" · "] : nil;
+}
+
++ (void)fetchCrossrefPreviewForURL:(NSURL *)url completion:(ApolloLinkPreviewCompletion)completion {
+    NSString *doi = ApolloLinkPreviewDOIFromURL(url);
+    if (doi.length == 0) {
+        completion(nil);
+        return;
+    }
+
+    NSString *encodedDOI = [doi stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    NSURL *apiURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://api.crossref.org/works/%@", encodedDOI]];
+    NSMutableURLRequest *request = ApolloLinkPreviewRequest(apiURL, 10.0);
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+        if (error || !data || httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
+            ApolloLog(@"[LinkPreviews] Crossref failed doi=%@ status=%ld err=%@", doi, (long)httpResponse.statusCode, error.localizedDescription);
+            completion(nil);
+            return;
+        }
+
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSDictionary *message = [json[@"message"] isKindOfClass:[NSDictionary class]] ? json[@"message"] : nil;
+        NSString *title = ApolloLinkPreviewFirstString(message[@"title"]);
+        if (title.length == 0) {
+            completion(nil);
+            return;
+        }
+
+        ApolloLinkPreview *preview = [ApolloLinkPreview new];
+        NSString *container = ApolloLinkPreviewFirstString(message[@"container-title"]);
+        NSString *publisher = ApolloLinkPreviewFirstString(message[@"publisher"]);
+        preview.siteName = container.length > 0 ? container : (publisher.length > 0 ? publisher : ApolloLinkPreviewHost(url));
+        preview.title = title;
+        preview.desc = ApolloLinkPreviewTruncatedString(ApolloLinkPreviewStringByStrippingHTMLTags(message[@"abstract"]) ?: [self crossrefSummaryFromMessage:message], 220);
+
+        NSArray *links = [message[@"link"] isKindOfClass:[NSArray class]] ? message[@"link"] : nil;
+        for (NSDictionary *link in links) {
+            if (![link isKindOfClass:[NSDictionary class]]) continue;
+            NSString *contentType = [link[@"content-type"] lowercaseString] ?: @"";
+            NSString *linkURL = link[@"URL"];
+            if ([contentType containsString:@"image"] || [linkURL.lowercaseString hasSuffix:@".jpg"] || [linkURL.lowercaseString hasSuffix:@".png"]) {
+                preview.imageURL = ApolloLinkPreviewURLFromString(linkURL, url);
+                if (preview.imageURL.absoluteString.length > 0) break;
+            }
+        }
+        if (preview.imageURL.absoluteString.length == 0) ApolloLinkPreviewApplyFallbackIcon(preview, url);
+        preview.fetchedAt = [NSDate date];
+        ApolloLog(@"[LinkPreviews] Crossref metadata doi=%@ titleLen=%lu desc=%d", doi, (unsigned long)preview.title.length, preview.desc.length > 0);
+        completion(preview);
+    }] resume];
+}
+
 + (NSDictionary<NSString *, NSString *> *)metaValuesFromHTML:(NSString *)html {
     if (html.length == 0) return @{};
 
@@ -683,6 +879,10 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
     if (titleMatch && titleMatch.numberOfRanges > 1) {
         values[@"title"] = [html substringWithRange:[titleMatch rangeAtIndex:1]];
     }
+    NSDictionary *jsonLD = ApolloLinkPreviewJSONLDValuesFromHTML(html);
+    [jsonLD enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, __unused BOOL *stop) {
+        if (key.length > 0 && value.length > 0 && !values[key]) values[key] = value;
+    }];
     return values;
 }
 
@@ -697,7 +897,13 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
             ApolloLog(@"[LinkPreviews] HTML fetch failed %@ status=%ld type=%@ bytes=%lu err=%@",
                       url.absoluteString, (long)httpResponse.statusCode, contentType ?: @"",
                       (unsigned long)data.length, error.localizedDescription);
-            completion(ApolloLinkPreviewFallbackPreviewForURL(url, contentType.length > 0 ? contentType : nil));
+            if (ApolloLinkPreviewDOIFromURL(url).length > 0) {
+                [self fetchCrossrefPreviewForURL:url completion:^(ApolloLinkPreview *preview) {
+                    completion(preview ?: ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+                }];
+            } else {
+                completion(ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+            }
             return;
         }
 
@@ -708,10 +914,26 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
 
         NSDictionary<NSString *, NSString *> *meta = [self metaValuesFromHTML:html];
         ApolloLinkPreview *preview = [ApolloLinkPreview new];
-        preview.siteName = ApolloLinkPreviewCleanString(meta[@"og:site_name"]) ?: ApolloLinkPreviewHost(url);
-        preview.title = ApolloLinkPreviewCleanString(meta[@"og:title"]) ?: ApolloLinkPreviewCleanString(meta[@"twitter:title"]) ?: ApolloLinkPreviewCleanString(meta[@"title"]);
-        preview.desc = ApolloLinkPreviewTruncatedString(meta[@"og:description"] ?: meta[@"twitter:description"] ?: meta[@"description"], 200);
-        preview.imageURL = ApolloLinkPreviewURLFromString(meta[@"og:image"] ?: meta[@"twitter:image"] ?: meta[@"twitter:image:src"], url);
+        preview.siteName = ApolloLinkPreviewCleanString(meta[@"og:site_name"])
+            ?: ApolloLinkPreviewCleanString(meta[@"citation_journal_title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"prism.publicationname"])
+            ?: ApolloLinkPreviewCleanString(meta[@"dc.publisher"])
+            ?: ApolloLinkPreviewCleanString(meta[@"jsonld:site_name"])
+            ?: ApolloLinkPreviewHost(url);
+        preview.title = ApolloLinkPreviewCleanString(meta[@"og:title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"twitter:title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"citation_title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"dc.title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"prism.title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"jsonld:title"])
+            ?: ApolloLinkPreviewCleanString(meta[@"title"]);
+        preview.desc = ApolloLinkPreviewTruncatedString(meta[@"og:description"]
+            ?: meta[@"twitter:description"]
+            ?: meta[@"citation_abstract"]
+            ?: meta[@"dc.description"]
+            ?: meta[@"jsonld:description"]
+            ?: meta[@"description"], 220);
+        preview.imageURL = ApolloLinkPreviewURLFromString(meta[@"og:image"] ?: meta[@"twitter:image"] ?: meta[@"twitter:image:src"] ?: meta[@"citation_image"] ?: meta[@"jsonld:image"], url);
         preview.fetchedAt = [NSDate date];
 
         if (ApolloLinkPreviewHostIs(url, @"the-numbers.com")) {
@@ -731,12 +953,33 @@ static NSMutableURLRequest *ApolloLinkPreviewRequest(NSURL *url, NSTimeInterval 
         // wait for verification" everywhere.
         if (ApolloLinkPreviewIsBlockedPage(preview.title, html)) {
             ApolloLog(@"[LinkPreviews] blocked-page sniff matched %@ title=%@", url.absoluteString, preview.title);
-            completion(ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+            if (ApolloLinkPreviewDOIFromURL(url).length > 0) {
+                [self fetchCrossrefPreviewForURL:url completion:^(ApolloLinkPreview *crossrefPreview) {
+                    completion(crossrefPreview ?: ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+                }];
+            } else {
+                completion(ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+            }
             return;
         }
 
         if (preview.title.length == 0 && preview.desc.length == 0 && preview.imageURL.absoluteString.length == 0) {
-            completion(ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+            if (ApolloLinkPreviewDOIFromURL(url).length > 0) {
+                [self fetchCrossrefPreviewForURL:url completion:^(ApolloLinkPreview *crossrefPreview) {
+                    completion(crossrefPreview ?: ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+                }];
+            } else {
+                completion(ApolloLinkPreviewFallbackPreviewForURL(url, nil));
+            }
+            return;
+        }
+
+        BOOL weakAcademicMetadata = ApolloLinkPreviewDOIFromURL(url).length > 0
+            && (preview.desc.length == 0 || [preview.title.lowercaseString hasPrefix:@"doi "]);
+        if (weakAcademicMetadata) {
+            [self fetchCrossrefPreviewForURL:url completion:^(ApolloLinkPreview *crossrefPreview) {
+                completion(crossrefPreview ?: preview);
+            }];
             return;
         }
 
