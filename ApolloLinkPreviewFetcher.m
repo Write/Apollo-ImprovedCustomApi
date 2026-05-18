@@ -95,9 +95,8 @@ static NSString *ApolloLinkPreviewDecodeNumericEntities(NSString *string) {
     return out;
 }
 
-static NSString *ApolloLinkPreviewCleanString(NSString *string) {
-    if (![string isKindOfClass:[NSString class]]) return nil;
-    NSString *clean = ApolloLinkPreviewDecodeNumericEntities(string);
+static NSString *ApolloLinkPreviewDecodeCommonNamedEntities(NSString *string) {
+    NSString *clean = string;
     clean = [clean stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
     clean = [clean stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
     clean = [clean stringByReplacingOccurrencesOfString:@"&apos;" withString:@"'"];
@@ -114,11 +113,49 @@ static NSString *ApolloLinkPreviewCleanString(NSString *string) {
     clean = [clean stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
     // &amp; last so we don't double-decode embedded entities.
     clean = [clean stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    return clean;
+}
+
+static NSString *ApolloLinkPreviewCleanString(NSString *string) {
+    if (![string isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = ApolloLinkPreviewDecodeCommonNamedEntities(ApolloLinkPreviewDecodeNumericEntities(string));
     clean = [clean stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
     NSRegularExpression *whitespace = [NSRegularExpression regularExpressionWithPattern:@"\\s+" options:0 error:nil];
     clean = [whitespace stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
     return clean.length > 0 ? clean : nil;
+}
+
+static NSString *ApolloLinkPreviewCleanMultilineString(NSString *string) {
+    if (![string isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = ApolloLinkPreviewDecodeCommonNamedEntities(ApolloLinkPreviewDecodeNumericEntities(string));
+    clean = [clean stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
+    clean = [clean stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+
+    NSRegularExpression *inlineWhitespace = [NSRegularExpression regularExpressionWithPattern:@"[\\t\\f\\v ]+" options:0 error:nil];
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    BOOL lastLineWasBlank = YES;
+    for (NSString *line in [clean componentsSeparatedByString:@"\n"]) {
+        NSString *trimmedLine = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        trimmedLine = [inlineWhitespace stringByReplacingMatchesInString:trimmedLine
+                                                                 options:0
+                                                                   range:NSMakeRange(0, trimmedLine.length)
+                                                            withTemplate:@" "];
+        if (trimmedLine.length == 0) {
+            if (!lastLineWasBlank) {
+                [lines addObject:@""];
+                lastLineWasBlank = YES;
+            }
+            continue;
+        }
+        [lines addObject:trimmedLine];
+        lastLineWasBlank = NO;
+    }
+    while (lines.count > 0 && lines.lastObject.length == 0) {
+        [lines removeLastObject];
+    }
+    NSString *joined = [lines componentsJoinedByString:@"\n"];
+    return joined.length > 0 ? joined : nil;
 }
 
 // Returns YES when the supplied URL points at a subreddit listing or a user
@@ -572,7 +609,7 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
             && cached.desc.length == 0
             && [cached.title isEqualToString:ApolloLinkPreviewTitleFromURL(url)];
         BOOL staleBluesky = ApolloBlueskyPostPartsFromURL(url)
-            && (![cached.previewKind isEqualToString:@"bluesky"] || cached.postText.length == 0);
+            && (![cached.previewKind isEqualToString:@"bluesky-post-v2"] || cached.postText.length == 0);
         if (!botWall && !weakAcademic && !weakGeneric && !staleBluesky) {
             if (completion) completion(cached);
             return;
@@ -926,7 +963,7 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
 
             NSString *displayName = ApolloLinkPreviewCleanString(author[@"displayName"]);
             NSString *handle = ApolloLinkPreviewCleanString(author[@"handle"]);
-            NSString *text = ApolloLinkPreviewCleanString(record[@"text"]);
+            NSString *text = ApolloLinkPreviewCleanMultilineString(record[@"text"]);
             NSString *title = nil;
             if (displayName.length > 0 && handle.length > 0) {
                 title = [NSString stringWithFormat:@"%@ (@%@)", displayName, handle];
@@ -938,7 +975,7 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
             preview.siteName = @"Bluesky";
             preview.title = title;
             preview.desc = ApolloLinkPreviewTruncatedString(text, 300);
-            preview.previewKind = @"bluesky";
+            preview.previewKind = @"bluesky-post-v2";
             preview.authorDisplayName = displayName;
             preview.authorHandle = handle;
             preview.postText = text;

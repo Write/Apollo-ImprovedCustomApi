@@ -811,7 +811,7 @@ static BOOL ApolloLPIsBlueskyPostURL(NSURL *url) {
 
 static BOOL ApolloLPIsBlueskyPostPreview(NSURL *url, ApolloLinkPreview *preview) {
     return ApolloLPIsBlueskyPostURL(url)
-        && [preview.previewKind isEqualToString:@"bluesky"]
+        && [preview.previewKind isEqualToString:@"bluesky-post-v2"]
         && (preview.postText.length > 0 || preview.authorDisplayName.length > 0 || preview.authorHandle.length > 0);
 }
 
