@@ -12,9 +12,9 @@ on:
         description: 'Upload to Catbox.moe'
         type: boolean
         default: false
-  schedule:
+  #schedule:
     # Runs every 6 hours to check for new releases
-    - cron: '0 */6 * * *'
+    #- cron: '0 */6 * * *'
 
 permissions:
   contents: write
