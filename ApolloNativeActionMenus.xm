@@ -8,8 +8,13 @@
 
 static char kApolloNativeActionMenuControllerKey;
 static char kApolloNativeActionMenuInvokingActionKey;
+static char kApolloNativeActionMenuWrappedModeratorActionKey;
+static char kApolloNativeActionMenuLifecycleFallbackKey;
+static char kApolloNativeActionMenuSourceViewKey;
+static char kApolloNativeActionMenuWrappedSourceActionKey;
 
 static __weak UIView *sApolloNativeActionMenuSourceView = nil;
+static __weak UIView *sApolloNativeActionMenuConfigurationSourceView = nil;
 static NSUInteger sApolloNativeActionMenuCaptureDepth = 0;
 static BOOL sApolloNativeActionMenuModeratorStyleStack[32];
 static BOOL sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
@@ -106,11 +111,158 @@ static NSString *ApolloNativeActionDefaultTitle(uint16_t actionKind) {
 }
 
 static UIColor *ApolloNativeActionMenuModeratorColor(void) {
-    return [UIColor colorWithRed:(33.0 / 255.0) green:(143.0 / 255.0) blue:(35.0 / 255.0) alpha:1.0];
+    return [UIColor colorWithRed:0.0 green:(148.0 / 255.0) blue:(16.0 / 255.0) alpha:1.0];
 }
 
 static BOOL ApolloNativeActionKindOpensModeratorMenu(uint16_t actionKind) {
     return actionKind == 124;
+}
+
+static BOOL ApolloNativeActionMenuTitleIsModerator(NSString *title) {
+    return [title isEqualToString:@"Moderator"];
+}
+
+static BOOL ApolloNativeActionMenuTitleIsDestructive(NSString *title) {
+    return [title isEqualToString:@"Delete"]
+        || [title hasPrefix:@"Delete "]
+        || [title isEqualToString:@"Remove"]
+        || [title hasPrefix:@"Remove "];
+}
+
+static UIImage *ApolloNativeActionMenuTintedImage(UIImage *image, UIColor *tintColor) {
+    if (!image || !tintColor) return image;
+
+    SEL tintSelector = @selector(imageWithTintColor:renderingMode:);
+    if (![image respondsToSelector:tintSelector]) return image;
+
+    return ((UIImage *(*)(id, SEL, UIColor *, UIImageRenderingMode))objc_msgSend)(
+        image,
+        tintSelector,
+        tintColor,
+        UIImageRenderingModeAlwaysOriginal
+    );
+}
+
+static void ApolloNativeActionMenuStyleElementTitle(UIMenuElement *element, UIColor *tintColor) {
+    if (!element || !tintColor || ![element respondsToSelector:@selector(setAttributedTitle:)]) return;
+
+    NSString *title = element.title;
+    if (title.length == 0) return;
+
+    NSAttributedString *attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
+        NSForegroundColorAttributeName: tintColor
+    }];
+    ((void (*)(id, SEL, id))objc_msgSend)(element, @selector(setAttributedTitle:), attributedTitle);
+}
+
+static void ApolloNativeActionMenuStyleElementImage(UIMenuElement *element, UIColor *tintColor) {
+    if (!element || !tintColor || !element.image) return;
+
+    UIImage *tintedImage = ApolloNativeActionMenuTintedImage(element.image, tintColor);
+    if (!tintedImage) return;
+
+    SEL setImageSelector = @selector(setImage:);
+    SEL privateSetImageSelector = NSSelectorFromString(@"_setImage:");
+    if ([element respondsToSelector:setImageSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(element, setImageSelector, tintedImage);
+    } else if ([element respondsToSelector:privateSetImageSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(element, privateSetImageSelector, tintedImage);
+    }
+}
+
+typedef void (^ApolloNativeActionMenuActionHandler)(UIAction *action);
+
+static void ApolloNativeActionMenuPrimeSourceView(UIView *sourceView) {
+    if (!sourceView.window) return;
+
+    sApolloNativeActionMenuSourceView = sourceView;
+    __weak UIView *weakSourceView = sourceView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *strongSourceView = weakSourceView;
+        if (sApolloNativeActionMenuCaptureDepth == 0 && sApolloNativeActionMenuSourceView == strongSourceView) {
+            sApolloNativeActionMenuSourceView = nil;
+        }
+    });
+}
+
+static void ApolloNativeActionMenuWrapSourceAction(UIAction *action, UIView *sourceView) {
+    if (!action || !sourceView || objc_getAssociatedObject(action, &kApolloNativeActionMenuWrappedSourceActionKey)) return;
+    if (![action respondsToSelector:@selector(handler)] || ![action respondsToSelector:@selector(setHandler:)]) return;
+
+    ApolloNativeActionMenuActionHandler originalHandler =
+        ((ApolloNativeActionMenuActionHandler (*)(id, SEL))objc_msgSend)(action, @selector(handler));
+    if (!originalHandler) return;
+
+    originalHandler = [originalHandler copy];
+    __weak UIView *weakSourceView = sourceView;
+    ApolloNativeActionMenuActionHandler wrappedHandler = ^(UIAction *selectedAction) {
+        ApolloNativeActionMenuPrimeSourceView(weakSourceView);
+        originalHandler(selectedAction);
+    };
+
+    ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setHandler:), wrappedHandler);
+    objc_setAssociatedObject(action, &kApolloNativeActionMenuWrappedSourceActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloNativeActionMenuWrapModeratorAction(UIAction *action) {
+    if (!action || objc_getAssociatedObject(action, &kApolloNativeActionMenuWrappedModeratorActionKey)) return;
+    if (![action respondsToSelector:@selector(handler)] || ![action respondsToSelector:@selector(setHandler:)]) return;
+
+    ApolloNativeActionMenuActionHandler originalHandler =
+        ((ApolloNativeActionMenuActionHandler (*)(id, SEL))objc_msgSend)(action, @selector(handler));
+    if (!originalHandler) return;
+
+    originalHandler = [originalHandler copy];
+    ApolloNativeActionMenuActionHandler wrappedHandler = ^(UIAction *selectedAction) {
+        sApolloNativeActionMenuNextPresentationModeratorStyle = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+        });
+        originalHandler(selectedAction);
+    };
+
+    ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setHandler:), wrappedHandler);
+    objc_setAssociatedObject(action, &kApolloNativeActionMenuWrappedModeratorActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloNativeActionMenuStyleElement(UIMenuElement *element, BOOL moderatorStyle, UIView *sourceView);
+
+static UIMenu *ApolloNativeActionMenuTransformMenu(UIMenu *menu, BOOL moderatorStyle, UIView *sourceView) {
+    if (![menu isKindOfClass:[UIMenu class]]) return menu;
+    ApolloNativeActionMenuStyleElement(menu, moderatorStyle, sourceView);
+    return menu;
+}
+
+static void ApolloNativeActionMenuStyleElement(UIMenuElement *element, BOOL moderatorStyle, UIView *sourceView) {
+    if (!element) return;
+
+    NSString *title = element.title ?: @"";
+    BOOL opensModeratorMenu = ApolloNativeActionMenuTitleIsModerator(title);
+    BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
+    UIColor *moderatorTintColor = ApolloNativeActionMenuModeratorColor();
+    UIColor *elementTintColor = (!destructive && (moderatorStyle || opensModeratorMenu)) ? moderatorTintColor : nil;
+
+    if (elementTintColor) {
+        ApolloNativeActionMenuStyleElementTitle(element, elementTintColor);
+        ApolloNativeActionMenuStyleElementImage(element, elementTintColor);
+    }
+
+    if ([element isKindOfClass:[UIAction class]]) {
+        UIAction *action = (UIAction *)element;
+        ApolloNativeActionMenuWrapSourceAction(action, sourceView);
+        if (destructive) {
+            action.attributes = action.attributes | UIMenuElementAttributesDestructive;
+        }
+        if (opensModeratorMenu) {
+            ApolloNativeActionMenuWrapModeratorAction(action);
+        }
+    } else if ([element isKindOfClass:[UIMenu class]]) {
+        UIMenu *menu = (UIMenu *)element;
+        BOOL childModeratorStyle = moderatorStyle || opensModeratorMenu;
+        for (UIMenuElement *child in menu.children) {
+            ApolloNativeActionMenuStyleElement(child, childModeratorStyle, sourceView);
+        }
+    }
 }
 
 static UIImage *ApolloNativeActionMenuSizedIcon(UIImage *image) {
@@ -278,6 +430,10 @@ static BOOL ApolloNativeActionMenuModeratorStyleActive(void) {
     return NO;
 }
 
+static BOOL ApolloNativeActionMenuActionControllerIsModeratorOnly(id actionController) {
+    return ApolloReadBoolIvar(actionController, "isShowingOnlyModeratorActions", NO);
+}
+
 static void ApolloNativeActionMenuBeginCaptureStyled(id sender, id owner, BOOL moderatorStyle) {
     UIView *sourceView = ApolloNativeActionMenuResolveSourceView(sender, owner);
     if (sourceView) {
@@ -314,6 +470,11 @@ static UITableView *ApolloNativeActionMenuTableView(id actionController) {
     return [tableView isKindOfClass:[UITableView class]] ? tableView : nil;
 }
 
+static void ApolloNativeActionMenuPrimeChainedSourceView(id actionController) {
+    UIView *sourceView = objc_getAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey);
+    ApolloNativeActionMenuPrimeSourceView(sourceView);
+}
+
 static void ApolloNativeActionMenuSelectRow(id actionController, NSInteger row) {
     if (!actionController || ![actionController respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
         ApolloLog(@"[NativeActionMenu] Cannot invoke ActionController row %ld", (long)row);
@@ -321,6 +482,7 @@ static void ApolloNativeActionMenuSelectRow(id actionController, NSInteger row) 
     }
 
     objc_setAssociatedObject(actionController, &kApolloNativeActionMenuInvokingActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloNativeActionMenuPrimeChainedSourceView(actionController);
 
     UITableView *tableView = ApolloNativeActionMenuTableView(actionController);
     NSIndexPath *indexPath = [NSIndexPath indexPathForRow:row inSection:0];
@@ -337,16 +499,11 @@ static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitl
         return nil;
     }
 
-    if (tintColor && image) {
-        SEL tintSelector = @selector(imageWithTintColor:renderingMode:);
-        if ([image respondsToSelector:tintSelector]) {
-            image = ((UIImage *(*)(id, SEL, UIColor *, UIImageRenderingMode))objc_msgSend)(
-                image,
-                tintSelector,
-                tintColor,
-                UIImageRenderingModeAlwaysOriginal
-            );
-        }
+    destructive = destructive || ApolloNativeActionMenuTitleIsDestructive(title);
+    if (destructive) {
+        tintColor = nil;
+    } else if (tintColor && image) {
+        image = ApolloNativeActionMenuTintedImage(image, tintColor);
     }
 
     UIAction *action = [UIAction actionWithTitle:title image:image identifier:nil handler:^(__unused UIAction *selectedAction) {
@@ -359,11 +516,8 @@ static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitl
         ApolloNativeActionMenuSelectRow(actionController, row);
     }];
 
-    if (tintColor && [action respondsToSelector:@selector(setAttributedTitle:)]) {
-        NSAttributedString *attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
-            NSForegroundColorAttributeName: tintColor
-        }];
-        ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setAttributedTitle:), attributedTitle);
+    if (tintColor) {
+        ApolloNativeActionMenuStyleElementTitle(action, tintColor);
     }
 
     if (subtitle.length > 0 && [action respondsToSelector:@selector(setSubtitle:)]) {
@@ -449,7 +603,8 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
         UIImage *image = ApolloNativeActionDefaultImage(actionKind);
         BOOL opensModeratorMenu = ApolloNativeActionKindOpensModeratorMenu(actionKind);
         UIColor *actionTintColor = opensModeratorMenu ? moderatorTintColor : menuTintColor;
-        UIAction *action = ApolloNativeActionMenuAction(title, subtitle, image, actionTintColor, opensModeratorMenu, NO, NO, enabled, actionController, (NSInteger)i);
+        BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
+        UIAction *action = ApolloNativeActionMenuAction(title, subtitle, image, actionTintColor, opensModeratorMenu, destructive, NO, enabled, actionController, (NSInteger)i);
         if (action) {
             [children addObject:action];
         }
@@ -461,7 +616,7 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
             uint8_t *element = (uint8_t *)textActionsBuffer + 0x20 + i * 0x18;
             NSInteger row = (NSInteger)(actionCount + i);
             NSString *title = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x00), *(uint64_t *)(element + 0x08));
-            BOOL destructive = *(uint8_t *)(element + 0x10) != 0;
+            BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
             BOOL checked = *(uint8_t *)(element + 0x12) != 0;
 
             UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row);
@@ -478,7 +633,7 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
             uint8_t *element = (uint8_t *)textActionsBuffer + 0x20 + i * 0x18;
             NSInteger row = (NSInteger)(actionCount + i);
             NSString *title = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x00), *(uint64_t *)(element + 0x08));
-            BOOL destructive = *(uint8_t *)(element + 0x10) != 0;
+            BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
             BOOL checked = *(uint8_t *)(element + 0x12) != 0;
 
             UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row);
@@ -539,6 +694,77 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
 
 @end
 
+typedef UIMenu * (^ApolloNativeActionMenuProvider)(NSArray<UIMenuElement *> *suggestedActions);
+
+%hook UIContextMenuConfiguration
++ (instancetype)configurationWithIdentifier:(id<NSCopying>)identifier previewProvider:(id)previewProvider actionProvider:(ApolloNativeActionMenuProvider)actionProvider {
+    ApolloNativeActionMenuProvider wrappedActionProvider = nil;
+    if (actionProvider) {
+        ApolloNativeActionMenuProvider originalActionProvider = [actionProvider copy];
+        UIView *sourceView = sApolloNativeActionMenuConfigurationSourceView;
+        wrappedActionProvider = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+            UIMenu *menu = originalActionProvider(suggestedActions);
+            BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive() || sApolloNativeActionMenuNextPresentationModeratorStyle;
+            if (sApolloNativeActionMenuNextPresentationModeratorStyle) {
+                sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+            }
+            return ApolloNativeActionMenuTransformMenu(menu, moderatorStyle, sourceView);
+        };
+    }
+    return %orig(identifier, previewProvider, wrappedActionProvider ?: actionProvider);
+}
+%end
+
+%hook _TtC6Apollo19PostCellActionTaker
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo24CommentSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo31CommentsHeaderSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo22InboxSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo21MediaViewerController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
 static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, void (^completion)(void)) {
     if (!ApolloNativeActionMenusEnabled()) return NO;
     if (![actionController isKindOfClass:objc_getClass("_TtC6Apollo16ActionController")]) return NO;
@@ -546,7 +772,9 @@ static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, voi
 
     ApolloNativeActionMenuSortSavedCategoriesIfNeeded(presenter, actionController);
 
-    BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive() || sApolloNativeActionMenuNextPresentationModeratorStyle;
+    BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive()
+        || sApolloNativeActionMenuNextPresentationModeratorStyle
+        || ApolloNativeActionMenuActionControllerIsModeratorOnly(actionController);
     if (sApolloNativeActionMenuNextPresentationModeratorStyle) {
         sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
     }
@@ -563,6 +791,7 @@ static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, voi
         ApolloLog(@"[NativeActionMenu] No source view/window for %@", actionController);
         return NO;
     }
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey, sourceView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     BOOL removeAnchorViewOnEnd = NO;
     UIView *anchorView = ApolloNativeActionMenuCreateProxyAnchorView(sourceView, &removeAnchorViewOnEnd);
@@ -593,6 +822,22 @@ static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, voi
     ApolloLog(@"[NativeActionMenu] Presented native menu with %lu item(s)", (unsigned long)menu.children.count);
     if (completion) completion();
     return YES;
+}
+
+static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionController) {
+    if (!ApolloNativeActionMenusEnabled()) return NO;
+    if (![actionController isKindOfClass:objc_getClass("_TtC6Apollo16ActionController")]) return NO;
+    if (ApolloReadBoolIvar(actionController, "showKeyboardOnAppearanceForTextEntryView", NO)) return NO;
+
+    BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive()
+        || sApolloNativeActionMenuNextPresentationModeratorStyle
+        || ApolloNativeActionMenuActionControllerIsModeratorOnly(actionController);
+    if (!ApolloNativeActionMenuBuildMenu(actionController, moderatorStyle)) return NO;
+
+    UIView *sourceView = sApolloNativeActionMenuSourceView
+        ?: ApolloNativeActionMenuSelectedCellForPresenter(presenter)
+        ?: ApolloNativeActionMenuViewForObject(presenter);
+    return sourceView.window != nil;
 }
 
 %hook _TtC6Apollo17LargePostCellNode
@@ -831,11 +1076,68 @@ static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, voi
 }
 %end
 
+%hook _TtC6Apollo37SettingsTouchIDPasscodeViewController
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    UIView *sourceView = [tableView cellForRowAtIndexPath:indexPath] ?: tableView;
+    ApolloNativeActionMenuBeginCapture(sourceView, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo27SettingsAboutViewController
+- (void)resetAllBarButtonItemTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo22SettingsViewController
+- (void)exportBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
 %hook _TtC6Apollo30CrosspostPerformViewController
 - (void)flairSelectorTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginCapture(sender, self);
     %orig;
     ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo16ActionController
+- (void)viewWillAppear:(BOOL)animated {
+    UIViewController *actionController = (UIViewController *)self;
+    if (!objc_getAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey)
+        && ApolloNativeActionMenuCanFallbackPresent(actionController.presentingViewController, self)) {
+        actionController.view.hidden = YES;
+    }
+    %orig;
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    if (objc_getAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey)) return;
+
+    UIViewController *actionController = (UIViewController *)self;
+    UIViewController *presenter = actionController.presentingViewController;
+    if (!ApolloNativeActionMenuCanFallbackPresent(presenter, self)) return;
+
+    objc_setAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    actionController.view.hidden = YES;
+
+    __strong UIViewController *strongActionController = actionController;
+    __strong UIViewController *strongPresenter = presenter;
+    [strongActionController dismissViewControllerAnimated:NO completion:^{
+        if (!ApolloNativeActionMenuPresent(strongPresenter, strongActionController, nil)) {
+            ApolloLog(@"[NativeActionMenu] Lifecycle fallback could not present native menu for %@", strongActionController);
+        }
+    }];
 }
 %end
 
