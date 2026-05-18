@@ -2,6 +2,7 @@
 #import "ApolloCommon.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
+#import "ApolloLinkPreviewCache.h"
 #import "UserDefaultConstants.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
@@ -20,6 +21,10 @@ typedef NS_ENUM(NSInteger, SectionIndex) {
     SectionAbout,
     SectionCount
 };
+
+static BOOL sLinkPreviewModeRefreshPending = NO;
+static NSString *sPendingLinkPreviewModeRefreshArea = nil;
+static NSInteger sPendingLinkPreviewModeRefreshMode = ApolloLinkPreviewModeFull;
 
 #pragma mark - Thanks To VC (forward decl)
 
@@ -316,6 +321,72 @@ typedef NS_ENUM(NSInteger, Tag) {
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
+- (NSString *)linkPreviewModeTextForMode:(NSInteger)mode {
+    switch (mode) {
+        case ApolloLinkPreviewModeOff:     return @"Off";
+        case ApolloLinkPreviewModeCompact: return @"Compact";
+        case ApolloLinkPreviewModeFull:
+        default:                           return @"Full";
+    }
+}
+
+- (void)setLinkPreviewMode:(NSInteger)mode body:(BOOL)body {
+    NSInteger row = body ? 5 : 6;
+    NSString *key = body ? UDKeyLinkPreviewBodyMode : UDKeyLinkPreviewCommentsMode;
+    if (body) {
+        sLinkPreviewBodyMode = mode;
+    } else {
+        sLinkPreviewCommentsMode = mode;
+    }
+    [[NSUserDefaults standardUserDefaults] setInteger:mode forKey:key];
+    sLinkPreviewModeRefreshPending = YES;
+    sPendingLinkPreviewModeRefreshArea = body ? @"body" : @"comments";
+    sPendingLinkPreviewModeRefreshMode = mode;
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewModeDidChangeNotification
+                                                        object:nil
+                                                      userInfo:@{
+                                                          @"area": body ? @"body" : @"comments",
+                                                          @"mode": @(mode),
+                                                      }];
+
+    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:row inSection:SectionMedia];
+    if ([[self.tableView indexPathsForVisibleRows] containsObject:indexPath]) {
+        [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+    }
+}
+
+- (void)presentLinkPreviewModeSheetFromSourceView:(UIView *)sourceView body:(BOOL)body {
+    NSInteger currentMode = body ? sLinkPreviewBodyMode : sLinkPreviewCommentsMode;
+    NSString *title = body ? @"Body Link Previews" : @"Comment Link Previews";
+    NSString *message = body ? @"Choose how rich link preview cards appear in feeds and post bodies." : @"Choose how rich link preview cards appear in comments.";
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *fullTitle = (currentMode == ApolloLinkPreviewModeFull) ? @"Full (Current)" : @"Full";
+    NSString *compactTitle = (currentMode == ApolloLinkPreviewModeCompact) ? @"Compact (Current)" : @"Compact";
+    NSString *offTitle = (currentMode == ApolloLinkPreviewModeOff) ? @"Off (Current)" : @"Off";
+
+    [sheet addAction:[UIAlertAction actionWithTitle:fullTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setLinkPreviewMode:ApolloLinkPreviewModeFull body:body];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:compactTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setLinkPreviewMode:ApolloLinkPreviewModeCompact body:body];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:offTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setLinkPreviewMode:ApolloLinkPreviewModeOff body:body];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 #pragma mark - View Lifecycle
 
 - (void)viewDidLoad {
@@ -329,6 +400,35 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self apollo_applyTheme];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+
+    if (!sLinkPreviewModeRefreshPending) return;
+    sLinkPreviewModeRefreshPending = NO;
+
+    NSString *areaName = [sPendingLinkPreviewModeRefreshArea copy] ?: @"unknown";
+    NSInteger mode = sPendingLinkPreviewModeRefreshMode;
+    NSDictionary *userInfo = @{
+        @"area": areaName,
+        @"mode": @(mode),
+        @"reason": @"settings-disappear",
+    };
+
+    // The feed/comment view is usually revealed right after this controller exits.
+    // Fire a short delayed refresh so off-screen cells get rebuilt when visible again.
+    ApolloLog(@"[LinkPreviews] settings-exit-mode-refresh area=%@ mode=%ld", areaName, (long)mode);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(350 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewModeDidChangeNotification
+                                                            object:nil
+                                                          userInfo:userInfo];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewModeDidChangeNotification
+                                                            object:nil
+                                                          userInfo:userInfo];
+    });
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
@@ -347,7 +447,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: return 2;
         case SectionAPIKeys: return 6; // 4 text fields + Can't sign in? + Instructions
         case SectionGeneral: return 8;
-        case SectionMedia: return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars] ? 8 : 7;
+        case SectionMedia: return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars] ? 11 : 10;
         case SectionSubreddits: return 5;
         case SectionAbout: return 4; // GitHub + Thanks To + Export Logs + Version
         default: return 0;
@@ -706,22 +806,67 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Inline Media Previews"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableInlineImages]
                                            action:@selector(inlineImagesSwitchToggled:)];
-        case 5:
+        case 5: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_LinkPreviewBodyMode"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Media_LinkPreviewBodyMode"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Rich Link Previews - Body";
+            cell.detailTextLabel.text = [self linkPreviewModeTextForMode:sLinkPreviewBodyMode];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            return cell;
+        }
+        case 6: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_LinkPreviewCommentsMode"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Media_LinkPreviewCommentsMode"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Rich Link Previews - Comments";
+            cell.detailTextLabel.text = [self linkPreviewModeTextForMode:sLinkPreviewCommentsMode];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            return cell;
+        }
+        case 7:
             return [self switchCellWithIdentifier:@"Cell_Media_UserAvatars"
                                             label:@"Show User Profile Pictures"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars]
                                            action:@selector(userAvatarsSwitchToggled:)];
-        case 6:
+        case 8:
             return [self switchCellWithIdentifier:@"Cell_Media_ProfileTabAvatar"
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
-        case 7: {
-            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearAvatarCache"];
-            if (!cell) {
-                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearAvatarCache"];
+        case 9: {
+            BOOL avatarsOn = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
+            if (avatarsOn) {
+                UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearAvatarCache"];
+                if (!cell) {
+                    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearAvatarCache"];
+                }
+                cell.textLabel.text = @"Clear Profile Picture Cache";
+                cell.textLabel.textColor = self.view.tintColor;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+                return cell;
             }
-            cell.textLabel.text = @"Clear Profile Picture Cache";
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
+            }
+            cell.textLabel.text = @"Clear Link Preview Cache";
+            cell.textLabel.textColor = self.view.tintColor;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            return cell;
+        }
+        case 10: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
+            }
+            cell.textLabel.text = @"Clear Link Preview Cache";
             cell.textLabel.textColor = self.view.tintColor;
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             return cell;
@@ -956,14 +1101,21 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
     } else if (indexPath.section == SectionMedia) {
         UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        BOOL avatarsOn = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
         if (indexPath.row == 0) {
             [self presentPreferredGIFFallbackFormatSheetFromSourceView:cell];
         } else if (indexPath.row == 1) {
             [self presentUnmuteCommentsVideosModeSheetFromSourceView:cell];
         } else if (indexPath.row == 2) {
             [self presentImageUploadProviderSheetFromSourceView:cell];
-        } else if (indexPath.row == 7) {
+        } else if (indexPath.row == 5) {
+            [self presentLinkPreviewModeSheetFromSourceView:cell body:YES];
+        } else if (indexPath.row == 6) {
+            [self presentLinkPreviewModeSheetFromSourceView:cell body:NO];
+        } else if (indexPath.row == 9 && avatarsOn) {
             [self promptClearProfilePictureCacheFromSourceView:cell];
+        } else if ((indexPath.row == 9 && !avatarsOn) || (indexPath.row == 10 && avatarsOn)) {
+            [self promptClearLinkPreviewCacheFromSourceView:cell];
         }
     }
 }
@@ -971,7 +1123,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == SectionBackupRestore) return YES;
     if (indexPath.section == SectionAPIKeys && (indexPath.row == 4 || indexPath.row == 5)) return YES;
-    if (indexPath.section == SectionMedia && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 7)) return YES;
+    if (indexPath.section == SectionMedia && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 5 || indexPath.row == 6 || indexPath.row == 9 || indexPath.row == 10)) return YES;
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2)) return YES;
     return NO;
 }
@@ -1250,12 +1402,14 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
     if (sShowUserAvatars == wasOn) return;
-    NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:7 inSection:SectionMedia]];
+    NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:9 inSection:SectionMedia]];
     if (sShowUserAvatars) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(sShowUserAvatars ? 10 : 9) inSection:SectionMedia]]
+                          withRowAnimation:UITableViewRowAnimationNone];
 }
 
 - (void)profileTabAvatarSwitchToggled:(UISwitch *)sender {
@@ -1280,6 +1434,17 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)inlineImagesSwitchToggled:(UISwitch *)sender {
     sEnableInlineImages = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sEnableInlineImages forKey:UDKeyEnableInlineImages];
+}
+
+- (void)promptClearLinkPreviewCacheFromSourceView:(__unused UIView *)sourceView {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Link Preview Cache?"
+                                                                   message:@"Cached link preview titles, descriptions, and thumbnails will be removed."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        [[ApolloLinkPreviewCache sharedCache] flushCache];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - Backup / Restore

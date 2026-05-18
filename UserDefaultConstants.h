@@ -52,3 +52,12 @@ static NSString *const UDKeyTagFilterSpoiler = @"TagFilterSpoiler";        // gl
 //   "mode"    -> NSString       ("hide" | "blur"; overrides global mode)
 // Missing keys fall back to global settings.
 static NSString *const UDKeyTagFilterSubredditOverrides = @"TagFilterSubredditOverrides";
+
+// Legacy boolean key from the first rich link preview builds. Kept only for migration.
+static NSString *const UDKeyEnableLinkPreviews = @"EnableLinkPreviews";
+// Legacy single rich link preview mode key. Kept only for migration.
+static NSString *const UDKeyLinkPreviewMode = @"LinkPreviewMode";
+// Rich link preview cards: 0 = Off, 1 = Compact, 2 = Full.
+static NSString *const UDKeyLinkPreviewBodyMode = @"LinkPreviewBodyMode";
+static NSString *const UDKeyLinkPreviewCommentsMode = @"LinkPreviewCommentsMode";
+static NSString *const ApolloLinkPreviewModeDidChangeNotification = @"ApolloLinkPreviewModeDidChangeNotification";
